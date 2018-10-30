@@ -1,9 +1,9 @@
-package go-common
+package common
 
 import (
 	"fmt"
 )
 
 func OnlyImports() {
-	fmt.println("import")
+	fmt.Println("import")
 }
