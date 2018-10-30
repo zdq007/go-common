@@ -3,77 +3,56 @@ package dao
 import (
 	"database/sql"
 	"encoding/json"
-	"strconv"
-
-	"github.com/donnie4w/go-logger/logger"
+	"fmt"
+	"github.com/Sirupsen/logrus"
 	_ "github.com/go-sql-driver/mysql"
+	"github.com/gogap/errors"
 	. "github.com/jinzhu/gorm"
+	"regexp"
 )
-
-var (
-	DAO *Dao
-)
-
-//解析为json时对应第字段类型
-const (
-	NUM = iota
-	STR
-)
-
-func init() {
-	DAO = new(Dao)
-}
 
 type Dao struct {
 	*DB
-	server string
-	user   string
-	pwd    string
-	dbname string
+	DBUrl string
 }
 
-func (self *Dao) init(server, user, pwd, dbname string) {
-	self.server = server
-	self.user = user
-	self.pwd = pwd
-	self.dbname = dbname
+func (self *Dao) Init() {
+	logrus.Info("Init database config!")
 }
 
-/**
-1.程序连接数据库会有连接泄漏的情况，需要及时释放连接
-2.Go sql包中的Query和QueryRow两个方法的连接不会自动释放连接，只有在遍历完结果或者调用close方法才会关闭连接
-3.Go sql中的Ping和Exec方法在调用结束以后就会自动释放连接
-4.忽略了函数的某个返回值不代表这个值就不存在了，如果该返回值需要close才会释放资源，直接忽略了就会导致资源的泄漏。
-5.有close方法的变量，在使用后要及时调用该方法，释放资源
-*/
-
-func (self *Dao) OpenDB(server string, user string, pwd string, dbname string, idle, max int, showsql bool) error {
-	self.init(server, user, pwd, dbname)
-	//&loc=Local&parseTime=True  如果想将查询的date  datetime timestep 类型的参数返回给 time.Time类型时候设置，默认返回[]byte/string
-	dburl := self.user + ":" + self.pwd + "@tcp(" + self.server + ")/" + self.dbname + "?charset=utf8"
-	db, err := Open("mysql", dburl)
-	self.DB = db
+//@title  产生一个数据库操作对象
+//@return 返回Dao指针
+func GenerateDB(args ...interface{}) (dao *Dao, err error) {
+	len := len(args)
+	if len < 1 {
+		return nil, errors.New("参数个数不对\n 至少传入数据库连接url( user:pwd@tcp(127.0.0.1)/dbname?charset=utf8 )")
+	}
+	dao = new(Dao)
+	dao.DBUrl = args[0].(string)
+	grom, err := Open("mysql", dao.DBUrl)
 	if err != nil {
-		logger.Error("打开数据库异常：", err)
+		logrus.Error("打开数据库异常：", err)
 	}
 
-	// Then you could invoke `*sql.DB`'s functions with it
-	err = self.DB.DB().Ping()
-	if err != nil {
-		logger.Error("连接数据库异常：", err)
-	}
+	dao.DB = grom
+
 	//初始连接数
-	self.DB.DB().SetMaxIdleConns(idle)
+	if len > 1 {
+		grom.DB().SetMaxIdleConns(args[1].(int))
+	}
 	//最大连接数
-	self.DB.DB().SetMaxOpenConns(max)
+	if len > 2 {
+		grom.DB().SetMaxOpenConns(args[2].(int))
+	}
+	//显示sql
+	if len > 3 {
+		grom.LogMode(args[3].(bool))
+	}
 
 	// Disable table name's pluralization
-	self.SingularTable(true)
+	grom.SingularTable(true)
 
-	//显示sql
-	self.LogMode(showsql)
-
-	return err
+	return
 }
 
 //查询一条记录 采用回调，在高调用函数的时候最好少采用回调函数的方式
@@ -95,7 +74,7 @@ func (self *Dao) QueryRowsCallback(backfn func(rows *sql.Rows), sql string, args
 		defer rows.Close()
 	}
 	if err != nil {
-		logger.Error("未查询到数据:", err)
+		logrus.Error("未查询到数据:", err)
 	} else {
 		for rows.Next() {
 			backfn(rows)
@@ -115,117 +94,10 @@ func (self *Dao) QueryCount(sql string, args ...interface{}) int64 {
 	return count
 }
 
-//查询一个字段
+//查询一个字段的值
 func (self *Dao) QueryOneField(sql string, args ...interface{}) (res interface{}) {
 	self.Raw(sql, args...).Row().Scan(&res)
 	return
-}
-
-//查找返回JSON数组 [{},{},{}]  ，因为mysql库查询返回的大部分类型都是[]BYTE  所以不能通过类型判断，只能由用户指定类型
-func (self *Dao) QueryArray(typeFlag []int, sqlstr string, args ...interface{}) ([]interface{}, error) {
-	rows, err := self.Raw(sqlstr, args...).Rows()
-	defer rows.Close()
-	if err == nil {
-		columns, err := rows.Columns()
-		if err == nil {
-			values := make([]sql.RawBytes, len(columns)) //sql.RawBytes
-			scanArgs := make([]interface{}, len(values))
-			for i := range values {
-				scanArgs[i] = &values[i]
-			}
-			result := make([]interface{}, 0)
-			for rows.Next() {
-				err = rows.Scan(scanArgs...)
-				if err != nil {
-					panic(err.Error())
-				}
-				record := make(map[string]interface{})
-
-				for i, col := range values {
-					if col == nil {
-						if typeFlag[i] == STR {
-							record[columns[i]] = ""
-						} else {
-							record[columns[i]] = 0
-						}
-					} else {
-						if typeFlag[i] == NUM {
-							n, err := strconv.ParseInt(string(col), 10, 64)
-							if err != nil {
-								n = 0
-							}
-							record[columns[i]] = n
-						} else {
-							record[columns[i]] = string(col)
-						}
-					}
-				}
-
-				result = append(result, record)
-			}
-
-			return result, nil
-		}
-	}
-	return nil, err
-}
-
-//查找返回数组 [a,b,c]
-func (self *Dao) QueryArr(typeFlag []int, sqlstr string, args ...interface{}) ([]interface{}, error) {
-	rows, err := self.Raw(sqlstr, args...).Rows()
-	defer rows.Close()
-	if err == nil {
-		columns, err := rows.Columns()
-		if err == nil {
-			values := make([]sql.RawBytes, len(columns)) //sql.RawBytes
-			scanArgs := make([]interface{}, len(values))
-			for i := range values {
-				scanArgs[i] = &values[i]
-			}
-			result := make([]interface{}, 0)
-			for rows.Next() {
-				err = rows.Scan(scanArgs...)
-				if err != nil {
-					panic(err.Error())
-				}
-				for i, col := range values {
-					if col == nil {
-						if typeFlag[i] == STR {
-							result = append(result, "")
-						} else {
-							result = append(result, 0)
-						}
-					} else {
-						if typeFlag[i] == NUM {
-							n, err := strconv.ParseInt(string(col), 10, 64)
-							if err != nil {
-								n = 0
-							}
-							result = append(result, n)
-						} else {
-							result = append(result, string(col))
-						}
-					}
-				}
-			}
-
-			return result, nil
-		}
-	}
-	return nil, err
-}
-
-//查询记录并返回json数组字符串
-func (self *Dao) QueryJSON(typeFlag []int, sql string, args ...interface{}) ([]byte, error) {
-	result, err := self.QueryArray(typeFlag, sql, args...)
-	if err == nil {
-		if len(result) == 0 {
-			return []byte("[]"), nil
-		}
-		return json.Marshal(result)
-	} else {
-		return nil, err
-	}
 }
 
 //执行修改 删除 等操作
@@ -237,11 +109,83 @@ func (self *Dao) Execute(sql string, arges ...interface{}) int64 {
 func (self *Dao) Save(sql string, arges ...interface{}) (int64, error) {
 	res, err := self.DB.DB().Exec(sql, arges...)
 	if err != nil {
-		return -1, err
+		return 0, err
 	}
 	id, err := res.LastInsertId()
 	if err != nil {
-		return -1, err
+		return 0, err
 	}
 	return id, nil
+}
+
+//@title  查找返回JSON数组 [{},{},{}] 因为mysql库查询返回的大部分类型都是[]BYTE  所以不能通过类型判断 只能由用户指定类型
+func (self *Dao) QueryArray(sqlstr string, args ...interface{}) (result []interface{}, err error) {
+	rows, err := self.Raw(sqlstr, args...).Rows()
+	if err == nil {
+		defer rows.Close()
+		columns, err := rows.Columns()
+		if err == nil {
+			values := make([]sql.RawBytes, len(columns)) //sql.RawBytes
+			scanArgs := make([]interface{}, len(values))
+			for i := range values {
+				scanArgs[i] = &values[i]
+			}
+			result = make([]interface{}, 0)
+			for rows.Next() {
+				err = rows.Scan(scanArgs...)
+				if err != nil {
+					panic(err.Error())
+				}
+				record := make(map[string]interface{})
+
+				for i, col := range values {
+					record[columns[i]] = col
+					if col != nil {
+						record[columns[i]] = string(col)
+					} else {
+						record[columns[i]] = nil
+					}
+				}
+				result = append(result, record)
+			}
+		}
+	}
+	return
+}
+
+//@title  查找返回JSON数组
+//@return 字符串,异常
+func (self *Dao) QueryJsonArray(sqlstr string, args ...interface{}) (string, error) {
+	arr, err := self.QueryArray(sqlstr, args...)
+	if err != nil {
+		return "", err
+	}
+	json, err := json.Marshal(arr)
+	if err != nil {
+		return "", err
+	}
+	return string(json), nil
+}
+
+var (
+	//初始sql替换为记录统计sql的正则匹配
+	countReg, _ = regexp.Compile(`(?i)^(select)[\w\W]+(from)\s`)
+)
+
+//@title 分页查询
+//@param
+//@return 结果,总记录数,异常
+func (self *Dao) QueryPageList(start, offset int, sqlstr string, args ...interface{}) (list []interface{}, count int64, err error) {
+	countSql := countReg.ReplaceAllString(sqlstr, "$1 count(*) $2 ")
+	fmt.Println(countSql)
+	count = self.QueryCount(countSql, args...)
+	fmt.Println("count: ", count)
+	if count > 0 {
+		//查询结果
+		list, err = self.QueryArray(sqlstr+" limit ?,?", append(args, start, offset)...)
+		return
+	} else {
+		list = make([]interface{}, 0, 0)
+		return
+	}
 }
