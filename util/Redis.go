@@ -2,7 +2,7 @@ package util
 
 import (
 	"fmt"
-	"github.com/gomodule/redigo"
+	"github.com/gomodule/redigo/redis"
 	"time"
 )
 
